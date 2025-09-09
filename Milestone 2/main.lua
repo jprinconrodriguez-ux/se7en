@@ -7,6 +7,7 @@ local Scoring = require("scoring")
 local Attacks = require("attacks")
 local Jokers = require("jokers")
 local JokerReg = require("joker_registry")
+local SaveLoad = require("saveload")
 
 -- === CONSTANTS (safe defaults) ===
 local HAND_START = HAND_START or 10   -- starting hand size
@@ -328,7 +329,12 @@ local function discardSelected()
   local drawn = deck:drawNoReshuffle(need)
   for i = 1, #drawn do table.insert(hand, drawn[i]) end
   local drew = #drawn
-  if currentSort == "suit" and Rules and Rules.sortHandBySuit then Rules.sortHandBySuit(hand) elseif Rules and Rules.sortHandByRank then Rules.sortHandByRank(hand) end  setStatus("Discarded "..#toDiscard..", drew "..tostring(drew)..".")
+  if currentSort == "suit" and Rules and Rules.sortHandBySuit then
+    Rules.sortHandBySuit(hand)
+  elseif Rules and Rules.sortHandByRank then
+    Rules.sortHandByRank(hand)
+  end
+  setStatus("Discarded "..#toDiscard..", drew "..tostring(drew)..".")
   -- stay in MAIN phase; you can still play a hand this turn
   GS.limits = GS.limits or {}
   GS.limits.discard_used = true
@@ -336,117 +342,15 @@ end
 
 -- === SAVE/LOAD CORE ===
 local function buildSaveState()
-  -- deck snapshot
-  local deckState = deck:getState()
-  -- hand snapshot (copy)
-  local handCopy = {}
-  for i = 1, #hand do
-    handCopy[i] = { suit = hand[i].suit, rank = hand[i].rank }
-  end
-  -- GS snapshot (shallow)
-  local gs = {
-    phase = GS.phase,
-    current_attack = (S and S.combat and S.combat.current_attack) or nil,
-    overlay = (UI and UI.overlay and UI.overlay.kind) or nil,
-    turn  = GS.turn,
-    playedHands = {},
-    limits = {
-      joker_played_this_turn = (GS.limits and GS.limits.joker_played_this_turn) or false,
-      discard_used = (GS.limits and GS.limits.discard_used) or false
-    },
-    meta   = GS.meta
-  }
-  for k,v in pairs(GS.playedHands) do gs.playedHands[k] = v and true or nil end
-
- local jokerState
-  if S.jokers then
-    jokerState = {
-      pool = {},
-      hand = {},
-      played_pile = {},
-      used_this_turn = S.jokers.used_this_turn
-    }
-    for i,id in ipairs(S.jokers.pool or {}) do jokerState.pool[i] = id end
-    for i,id in ipairs(S.jokers.hand or {}) do jokerState.hand[i] = id end
-    for i,id in ipairs(S.jokers.played_pile or {}) do jokerState.played_pile[i] = id end
-  end
-
-  local scoring
-  if S.meta then
-    scoring = {}
-    for k,v in pairs(S.meta) do scoring[k] = v end
-  end
-
-  return {
-    version = 2,
-    hand    = handCopy,
-    deck    = deckState,
-    gs      = gs,
-    jokers  = jokerState,
-    scoring = scoring,
-    meta    = { timestamp = os.time() }
-  }
+  return SaveLoad.build_state(deck, hand, GS, S, UI)
 end
 
 local function applyLoadedState(state)
-  -- deck
-  if deck and deck.loadState and state.deck then
-    deck:loadState(state.deck)
-  end
-  -- hand
-  hand = {}
-  for i = 1, #(state.hand or {}) do
-    local c = state.hand[i]
-    hand[i] = { suit = c.suit, rank = c.rank }
-  end
-  -- GS
-  GS.phase = (state.gs and state.gs.phase) or "MAIN"
-  GS.turn  = (state.gs and state.gs.turn)  or 1
-  GS.playedHands = {}
-  if state.gs and state.gs.playedHands then
-    for k,v in pairs(state.gs.playedHands) do GS.playedHands[k] = v and true or nil end
-  end
-  GS.limits = state.gs and state.gs.limits or { joker_played_this_turn = false, discard_used = false }
-  if state.gs and state.gs.overlay then
-    local k = state.gs.overlay
-    UI.overlay = { kind = k, message = (k == "win") and "You Win!" or "Threshold completed" }
-    GS.phase = "THRESHOLD"
-  else
-    UI.overlay = nil
-  end
-  GS.meta   = state.gs and state.gs.meta or { run_id = 1 }
-
-  -- restore current attack if saved
-  S.combat = S.combat or {}
-  S.combat.current_attack = state.gs and state.gs.current_attack or S.combat.current_attack
-
-    if state.scoring then
-    S.meta = {}
-    for k,v in pairs(state.scoring) do S.meta[k] = v end
-  else
-    S.meta = nil
-  end
-  if Scoring then Scoring.init(S) end
-
-  if Jokers then
-    Jokers.init(S, love.math)
-    if state.jokers then
-      S.jokers.pool = {}
-      S.jokers.hand = {}
-      S.jokers.played_pile = {}
-      for i,id in ipairs(state.jokers.pool or {}) do S.jokers.pool[i] = id end
-      for i,id in ipairs(state.jokers.hand or {}) do S.jokers.hand[i] = id end
-      for i,id in ipairs(state.jokers.played_pile or {}) do S.jokers.played_pile[i] = id end
-      S.jokers.used_this_turn = state.jokers.used_this_turn
-    end
-  end
-
-  -- local cleans
+  hand = SaveLoad.apply_state(state, deck, GS, S, UI, Scoring, Jokers)
   selected = {}
   selectedJoker = nil
   lastResult = nil
   setStatus("Loaded game. Phase: "..GS.phase..", Turn "..tostring(GS.turn))
-  -- Re-apply sort mode after loading
   currentSort = (state.gs and (state.gs.sortPref or state.gs.sortMode)) or currentSort or "rank"
   if currentSort == "suit" and Rules and Rules.sortHandBySuit then
     Rules.sortHandBySuit(hand)
@@ -819,7 +723,11 @@ function love.keypressed(key)
       return
     end
     local idx = selectedJoker or 1
-    if Jokers and Jokers.can_use(S) and S.jokers and S.jokers.hand[idx] then
+    if not S.jokers or #S.jokers.hand == 0 then
+      setStatus("No joker ready.")
+    elseif S.jokers.used_this_turn then
+      setStatus("Joker already used this turn.")
+    else
       local res = Jokers.use(S, idx, {source="key"})
       selectedJoker = nil
       if res and res.msg then
@@ -827,8 +735,6 @@ function love.keypressed(key)
       else
         setStatus("Used joker.")
       end
-    else
-      setStatus("No joker ready.")
     end
 
   elseif key == "c" then
@@ -892,11 +798,6 @@ function love.draw()
   hud_y = hud_y + 30
   love.graphics.print("Turn: "..tostring(GS.turn or 1).."   Phase: "..GS.phase, 40, hud_y)
   hud_y = hud_y + 20
-  if S and S.meta then
-    local L = S.meta.pressure_level or 0
-    local nxt = (Scoring and Scoring.pressure_next_in and Scoring.pressure_next_in(S)) or 30
-    love.graphics.print("Pressure: "..tostring(L).."  (next in "..tostring(nxt).." turns)", 40, hud_y)
-  end
   local lastPlayedY = hud_y + 25
   
   -- Buttons
